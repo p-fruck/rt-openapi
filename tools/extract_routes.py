@@ -606,6 +606,181 @@ def collect_test_evidence(test_dir: Path) -> Dict[str, object]:
     return {"operations": operations}
 
 
+def extract_perl_var_assignments(lines: List[str]) -> Dict[str, str]:
+    assignments: Dict[str, str] = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.search(r"\bmy\s+\$(\w+)\s*=\s*([\[{])", line)
+        if not m:
+            i += 1
+            continue
+
+        var_name = m.group(1)
+        start_char = m.group(2)
+        open_char = start_char
+        close_char = "}" if open_char == "{" else "]"
+
+        start_idx = line.find(open_char, m.end() - 1)
+        chunk_lines = [line[start_idx:]] if start_idx >= 0 else []
+        depth = 1 if start_idx >= 0 else 0
+        j = i + 1
+        while j < len(lines) and depth > 0:
+            chunk_lines.append(lines[j])
+            depth += lines[j].count(open_char) - lines[j].count(close_char)
+            if depth <= 0 and ";" in lines[j]:
+                break
+            j += 1
+
+        if chunk_lines:
+            text = "\n".join(chunk_lines)
+            semi = text.rfind(";")
+            if semi >= 0:
+                text = text[:semi]
+            assignments[var_name] = text.strip()
+
+        i = max(i + 1, j)
+    return assignments
+
+
+def perl_literal_to_json_value(literal: str) -> Optional[object]:
+    text = literal.strip()
+    if not text:
+        return None
+
+    # Replace Perl variables with stable placeholder strings.
+    text = re.sub(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?", '"<var>"', text)
+    text = text.replace("=>", ":")
+    text = re.sub(r"\bundef\b", "null", text)
+
+    # Quote bare keys in hash literals.
+    text = re.sub(r"([\{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', text)
+    # Remove trailing commas before closing.
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    # Normalize single-quoted strings.
+    text = re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", lambda m: json.dumps(m.group(1)), text)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def collect_test_examples(test_dir: Path) -> Dict[str, object]:
+    if not test_dir.exists():
+        return {"operations": []}
+
+    operation_examples: Dict[Tuple[str, str], Dict[str, object]] = {}
+    call_start = re.compile(rf"(?:my\s+)?\$(\w+)\s*=\s*\$mech->({TEST_HTTP_CALL})\s*\(")
+
+    for file in sorted(test_dir.glob("*.t")):
+        lines = file.read_text(encoding="utf-8", errors="replace").splitlines()
+        var_assignments = extract_perl_var_assignments(lines)
+        pending_last_op: Optional[Tuple[str, str]] = None
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            m = call_start.search(line)
+            if m:
+                method_name = m.group(2)
+                call_lines = [line[m.start() :]]
+                paren_balance = call_lines[0].count("(") - call_lines[0].count(")")
+                j = i + 1
+                while j < len(lines) and (paren_balance > 0 or ";" not in call_lines[-1]):
+                    call_lines.append(lines[j])
+                    paren_balance += lines[j].count("(") - lines[j].count(")")
+                    if lines[j].strip().endswith(";") and paren_balance <= 0:
+                        break
+                    j += 1
+
+                call_text = "\n".join(call_lines)
+                open_idx = call_text.find("(")
+                close_idx = call_text.rfind(")")
+                args_text = call_text[open_idx + 1 : close_idx] if open_idx >= 0 and close_idx > open_idx else ""
+                args = split_top_level_args(args_text)
+                path_expr = args[0] if args else ""
+                path = normalize_test_path(path_expr)
+                http = perl_method_to_http(method_name)
+
+                if path and http:
+                    key = (path, http)
+                    item = operation_examples.setdefault(
+                        key,
+                        {
+                            "path": path,
+                            "method": http,
+                            "request_example": None,
+                            "response_key_hints": set(),
+                            "files": set(),
+                        },
+                    )
+                    item["files"].add(str(file))
+                    pending_last_op = key
+
+                    if http in ("POST", "PUT", "PATCH") and len(args) >= 2 and item["request_example"] is None:
+                        payload_expr = args[1].strip()
+                        payload_literal = payload_expr
+                        var_ref = re.fullmatch(r"\$(\w+)", payload_expr)
+                        if var_ref:
+                            payload_literal = var_assignments.get(var_ref.group(1), payload_expr)
+                        parsed_payload = perl_literal_to_json_value(payload_literal)
+                        if parsed_payload is not None:
+                            item["request_example"] = parsed_payload
+
+                i = max(i + 1, j)
+
+            # Collect lightweight response key hints from json_response field assertions.
+            if pending_last_op:
+                m_content = re.findall(r"\$content->\{([A-Za-z0-9_]+)\}", line)
+                m_inline = re.findall(r"json_response->\{([A-Za-z0-9_]+)\}", line)
+                for key_name in m_content + m_inline:
+                    operation_examples[pending_last_op]["response_key_hints"].add(key_name)
+
+            i += 1
+
+    operations = []
+    for key in sorted(operation_examples):
+        op = operation_examples[key]
+        operations.append(
+            {
+                "path": op["path"],
+                "method": op["method"],
+                "request_example": op["request_example"],
+                "response_key_hints": sorted(op["response_key_hints"]),
+                "files": sorted(op["files"]),
+            }
+        )
+    return {"operations": operations}
+
+
+def index_test_examples(test_examples: Dict[str, object]) -> Dict[Tuple[str, str], Dict[str, object]]:
+    index: Dict[Tuple[str, str], Dict[str, object]] = {}
+    ops = test_examples.get("operations", []) if isinstance(test_examples, dict) else []
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        path = op.get("path")
+        method = op.get("method")
+        if isinstance(path, str) and isinstance(method, str) and method in HTTP_SET:
+            index[(path, method)] = op
+    return index
+
+
+def find_test_example_for_operation(
+    example_index: Dict[Tuple[str, str], Dict[str, object]],
+    op_path: str,
+    method: str,
+) -> Optional[Dict[str, object]]:
+    direct = example_index.get((op_path, method))
+    if direct:
+        return direct
+    for (path, meth), op in example_index.items():
+        if meth == method and equivalent_path_templates(path, op_path):
+            return op
+    return None
+
+
 def template_to_regex(path_template: str) -> re.Pattern:
     escaped = re.escape(path_template)
     escaped = re.sub(r"\\\{[^}]+\\\}", r"[^/]+", escaped)
@@ -951,9 +1126,11 @@ def build_openapi(
     runtime_meta: Dict[str, object],
     resource_query_params: Dict[str, List[str]],
     resource_content_types: Dict[str, Dict[str, List[str]]],
+    test_examples: Dict[str, object],
 ) -> Dict:
     paths_obj: Dict[str, Dict[str, object]] = {}
     evidence_index = index_test_evidence(test_evidence)
+    example_index = index_test_examples(test_examples)
     head_405_set = set(head_405_operations)
 
     for entry in inventory["paths"]:
@@ -979,6 +1156,7 @@ def build_openapi(
             media_types = media_types_for_entry(entry, resource_content_types)
 
             evidence = find_evidence_for_operation(evidence_index, path, method)
+            test_example = find_test_example_for_operation(example_index, path, method)
             if evidence:
                 observed = evidence.get("status_codes", [])
                 if isinstance(observed, list):
@@ -1032,6 +1210,12 @@ def build_openapi(
                     "description": "OK",
                     "content": response_content,
                 }
+                if test_example and test_example.get("response_key_hints"):
+                    hints = test_example.get("response_key_hints")
+                    if isinstance(hints, list) and hints:
+                        example_obj = {key: "<example>" for key in hints[:20] if isinstance(key, str)}
+                        for media in response_content:
+                            operation_obj["responses"]["200"]["content"][media]["example"] = example_obj
 
             if method in ("POST", "PUT", "PATCH"):
                 default_json_schema = request_body_schema_for_operation(entry, evidence)
@@ -1040,6 +1224,10 @@ def build_openapi(
                     media: {"schema": schema_for_request_media_type(media, default_json_schema)}
                     for media in request_media_types
                 }
+                if test_example and test_example.get("request_example") is not None:
+                    req_example = test_example.get("request_example")
+                    if "application/json" in request_content:
+                        request_content["application/json"]["example"] = req_example
                 operation_obj["requestBody"] = {
                     "required": False,
                     "content": request_content,
@@ -1051,6 +1239,12 @@ def build_openapi(
                     "calls": evidence.get("calls", 0),
                     "status_codes": evidence.get("status_codes", []),
                     "files": evidence.get("files", []),
+                }
+
+            if test_example:
+                operation_obj["x-rt-test-examples"] = {
+                    "files": test_example.get("files", []),
+                    "response_key_hints": test_example.get("response_key_hints", []),
                 }
 
             if runtime_codes:
@@ -1333,6 +1527,7 @@ def main() -> None:
     test_hints = collect_test_method_hints(test_dir)
     inventory = build_inventory(route_defs, test_hints)
     test_evidence = collect_test_evidence(test_dir)
+    test_examples = collect_test_examples(test_dir)
     probe_analysis = load_probe_analysis(workspace / "out" / "probe-analysis.json")
     runtime_status_by_operation, head_405_operations, runtime_meta = index_runtime_probe_overrides(probe_analysis)
 
@@ -1346,9 +1541,11 @@ def main() -> None:
 
     inventory_path = out_dir / "endpoint-inventory.json"
     test_evidence_path = out_dir / "test-evidence.json"
+    test_examples_path = out_dir / "test-examples.json"
     runtime_overrides_path = out_dir / "runtime-overrides.json"
     inventory_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     test_evidence_path.write_text(json.dumps(test_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    test_examples_path.write_text(json.dumps(test_examples, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     runtime_overrides_path.write_text(
         json.dumps(
             {
@@ -1372,6 +1569,7 @@ def main() -> None:
         runtime_meta,
         resource_query_params,
         resource_content_types,
+        test_examples,
     )
     spec_json_path = spec_dir / "openapi.json"
     spec_yaml_path = spec_dir / "openapi.yaml"
@@ -1385,6 +1583,7 @@ def main() -> None:
         "paths": inventory["meta"]["path_count"],
         "inventory": str(inventory_path.relative_to(workspace)),
         "test_evidence": str(test_evidence_path.relative_to(workspace)),
+        "test_examples": str(test_examples_path.relative_to(workspace)),
         "runtime_overrides": str(runtime_overrides_path.relative_to(workspace)),
         "openapi_json": str(spec_json_path.relative_to(workspace)),
         "openapi_yaml": str(spec_yaml_path.relative_to(workspace)),

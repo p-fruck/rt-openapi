@@ -6,6 +6,7 @@ This repository builds a deterministic OpenAPI specification baseline for RT RES
 
 - Complete endpoint inventory: `out/endpoint-inventory.json`
 - Deterministic test evidence map: `out/test-evidence.json`
+- Deterministic test examples map: `out/test-examples.json`
 - Runtime override map from probe analysis: `out/runtime-overrides.json`
 - OpenAPI skeleton (methods + path params + base security):
   - `spec/openapi.json`
@@ -86,6 +87,7 @@ make phase3
 - Routes are extracted from `lib/RT/REST2/Resource/*.pm` `dispatch_rules` regex declarations.
 - Methods are extracted from `allowed_methods` when present, with deterministic fallbacks and test-based hints from `t/rest2/*.t`.
 - RT tests are parsed to capture request method/path usage, asserted status codes, and JSON-body hints.
+- RT tests are parsed to extract request payload examples and response key hints, which are attached to operations as examples and metadata.
 - Runtime probe analysis is consumed during extraction to add explicit observed status codes and prune `HEAD` operations that consistently return `405`.
 - The OpenAPI output is still schema-light by design, but now includes test evidence metadata plus runtime evidence metadata.
 - Query parameters are source-derived from resource classes and emitted as reusable OpenAPI component parameters.
