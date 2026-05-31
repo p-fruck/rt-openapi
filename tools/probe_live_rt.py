@@ -13,6 +13,24 @@ from typing import Dict, List, Tuple
 SAFE_METHODS = {"get", "head"}
 
 
+def load_dotenv(dotenv_path: Path) -> None:
+    if not dotenv_path.exists():
+        return
+
+    for raw_line in dotenv_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if value and ((value[0] == value[-1]) and value[0] in ('"', "'")):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
 def substitute_path_params(path: str) -> str:
     # Conservative deterministic defaults; can be overridden in future with fixtures.
     def repl(match: re.Match[str]) -> str:
@@ -26,33 +44,46 @@ def substitute_path_params(path: str) -> str:
     return re.sub(r"\{([^}]+)\}", repl, path)
 
 
-def build_auth_header(args: argparse.Namespace) -> Dict[str, str]:
+def build_auth_header(args: argparse.Namespace) -> Tuple[Dict[str, str], str]:
     headers: Dict[str, str] = {}
 
-    if args.auth_mode == "none":
-        return headers
+    auth_mode = args.auth_mode
+    if auth_mode == "auto":
+        if args.token or os.environ.get("RT_TOKEN", ""):
+            auth_mode = "token"
+        elif (args.user or os.environ.get("RT_USERNAME", "")) and (
+            args.password or os.environ.get("RT_PASSWORD", "")
+        ):
+            auth_mode = "basic"
+        elif args.cookie or os.environ.get("RT_COOKIE", ""):
+            auth_mode = "cookie"
+        else:
+            auth_mode = "none"
 
-    if args.auth_mode == "token":
-        token = args.token or os.environ.get("RT_API_TOKEN", "")
+    if auth_mode == "none":
+        return headers, auth_mode
+
+    if auth_mode == "token":
+        token = args.token or os.environ.get("RT_TOKEN", "")
         if token:
             headers["Authorization"] = f"token {token}"
-        return headers
+        return headers, auth_mode
 
-    if args.auth_mode == "basic":
-        user = args.user or os.environ.get("RT_USER", "")
+    if auth_mode == "basic":
+        user = args.user or os.environ.get("RT_USERNAME", "")
         password = args.password or os.environ.get("RT_PASSWORD", "")
         if user or password:
             raw = f"{user}:{password}".encode("utf-8")
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
-        return headers
+        return headers, auth_mode
 
-    if args.auth_mode == "cookie":
+    if auth_mode == "cookie":
         cookie = args.cookie or os.environ.get("RT_COOKIE", "")
         if cookie:
             headers["Cookie"] = cookie
-        return headers
+        return headers, auth_mode
 
-    return headers
+    return headers, auth_mode
 
 
 def status_group(code: int) -> str:
@@ -84,16 +115,20 @@ def collect_probe_targets(openapi: Dict[str, object], max_ops: int) -> List[Tupl
 
 def probe(args: argparse.Namespace) -> Dict[str, object]:
     workspace = Path(args.workspace).resolve()
+    load_dotenv(workspace / ".env")
     openapi_path = workspace / "spec" / "openapi.json"
     if not openapi_path.exists():
         raise SystemExit(f"Missing OpenAPI file: {openapi_path}")
 
     openapi = json.loads(openapi_path.read_text(encoding="utf-8"))
-    headers = build_auth_header(args)
+    headers, effective_auth_mode = build_auth_header(args)
     headers.setdefault("Accept", "application/json")
 
     targets = collect_probe_targets(openapi, args.max_ops)
     base_url = args.base_url.rstrip("/")
+    if args.base_url == "http://localhost":
+        base_url = os.environ.get("RT_SERVER", "") or base_url
+        base_url = base_url.rstrip("/")
 
     results = []
     started = time.time()
@@ -145,6 +180,8 @@ def probe(args: argparse.Namespace) -> Dict[str, object]:
             "max_ops": args.max_ops,
             "timeout_seconds": args.timeout,
             "auth_mode": args.auth_mode,
+            "effective_auth_mode": effective_auth_mode,
+            "auth_header_present": bool(headers.get("Authorization") or headers.get("Cookie")),
             "started_at_epoch": int(started),
             "finished_at_epoch": int(finished),
             "duration_ms": int((finished - started) * 1000),
@@ -163,7 +200,7 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://localhost")
     parser.add_argument("--max-ops", type=int, default=120)
     parser.add_argument("--timeout", type=int, default=8)
-    parser.add_argument("--auth-mode", choices=["none", "token", "basic", "cookie"], default="none")
+    parser.add_argument("--auth-mode", choices=["auto", "none", "token", "basic", "cookie"], default="auto")
     parser.add_argument("--token", default="")
     parser.add_argument("--user", default="")
     parser.add_argument("--password", default="")

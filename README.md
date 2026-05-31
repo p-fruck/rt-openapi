@@ -34,11 +34,32 @@ This runs safe read-only probes (GET/HEAD) against generated operations and writ
 make probe
 ```
 
+By default, the probe script auto-loads `.env` from the workspace root and auto-selects auth mode from available credentials (`RT_TOKEN`, `RT_USERNAME` + `RT_PASSWORD`, or `RT_COOKIE`) and runs agains the configured baseurl (falls back to `RT_SERVER`).
+
+python3 tools/probe_live_rt.py --workspace 
 Optional auth examples:
 
-```bash
-python3 tools/probe_live_rt.py --workspace . --auth-mode token --token "1-14-..." --base-url "http://localhost"
+```bash. --auth-mode token --token "1-14-..." --base-url "http://localhost"
 python3 tools/probe_live_rt.py --workspace . --auth-mode basic --user test --password secret --base-url "http://localhost"
+```
+
+## Analyze probe results
+
+Compare runtime probe observations to generated OpenAPI responses and produce deterministic reports:
+
+```bash
+make analyze
+```
+
+Outputs:
+
+- `out/probe-analysis.json`
+- `out/coverage-report.md`
+
+One-shot refresh for generation + probing + analysis:
+
+```bash
+make phase3
 ```
 
 ## Notes
