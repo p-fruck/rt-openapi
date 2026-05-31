@@ -5,7 +5,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 HTTP_ORDER = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 HTTP_SET = set(HTTP_ORDER)
@@ -20,6 +20,22 @@ class RouteDef:
     methods: Tuple[str, ...]
     methods_explicit: bool
     roles: Tuple[str, ...]
+
+
+KNOWN_QUERY_PARAMS = {
+    "page",
+    "per_page",
+    "order",
+    "orderby",
+    "find_disabled_rows",
+    "fields",
+    "query",
+    "simple",
+    "category",
+    "group",
+    "user",
+    "type",
+}
 
 
 def find_matching_brace(text: str, start_idx: int) -> int:
@@ -127,6 +143,66 @@ def parse_resource_file(path: Path) -> List[RouteDef]:
             )
         )
     return routes
+
+
+def collect_resource_query_params(resource_dir: Path) -> Dict[str, List[str]]:
+    mapping: Dict[str, Set[str]] = {}
+    for file in sorted(resource_dir.glob("*.pm")):
+        name = file.name
+        if name.endswith("_Overlay.pm") or name.endswith("_Vendor.pm") or name.endswith("_Local.pm"):
+            continue
+
+        text = file.read_text(encoding="utf-8", errors="replace")
+        pkg = re.search(r"^\s*package\s+([A-Za-z0-9_:]+)\s*;", text, flags=re.M)
+        if not pkg:
+            continue
+        resource_class = pkg.group(1)
+
+        params = set(re.findall(r"request->param\('([A-Za-z0-9_\[\]]+)'\)", text))
+        params = {p for p in params if p in KNOWN_QUERY_PARAMS}
+        if params:
+            mapping[resource_class] = params
+
+    return {k: sorted(v) for k, v in sorted(mapping.items())}
+
+
+def collect_resource_content_types(resource_dir: Path) -> Dict[str, Dict[str, List[str]]]:
+    mapping: Dict[str, Dict[str, Set[str]]] = {}
+    for file in sorted(resource_dir.glob("*.pm")):
+        name = file.name
+        if name.endswith("_Overlay.pm") or name.endswith("_Vendor.pm") or name.endswith("_Local.pm"):
+            continue
+
+        text = file.read_text(encoding="utf-8", errors="replace")
+        pkg = re.search(r"^\s*package\s+([A-Za-z0-9_:]+)\s*;", text, flags=re.M)
+        if not pkg:
+            continue
+        resource_class = pkg.group(1)
+
+        accepted = set()
+        provided = set()
+
+        accepted_block = get_sub_block(text, "content_types_accepted")
+        provided_block = get_sub_block(text, "content_types_provided")
+
+        if accepted_block:
+            accepted.update(re.findall(r"'([A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+)'", accepted_block))
+        if provided_block:
+            provided.update(re.findall(r"'([A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+)'", provided_block))
+
+        if accepted or provided:
+            mapping[resource_class] = {
+                "accepted": accepted,
+                "provided": provided,
+            }
+
+    out: Dict[str, Dict[str, List[str]]] = {}
+    for resource_class in sorted(mapping):
+        out[resource_class] = {
+            "accepted": sorted(mapping[resource_class]["accepted"]),
+            "provided": sorted(mapping[resource_class]["provided"]),
+        }
+    return out
 
 
 def infer_route_specific_methods(route: RouteDef, path: str) -> List[str]:
@@ -643,15 +719,109 @@ def tag_for_path(path: str) -> str:
 def path_parameters(path: str) -> List[Dict[str, object]]:
     params = []
     for name in re.findall(r"\{([^}]+)\}", path):
+        schema: Dict[str, object] = {"type": "string"}
+        if name.startswith("id"):
+            schema = {"type": "integer", "format": "int64"}
         params.append(
             {
                 "name": name,
                 "in": "path",
                 "required": True,
-                "schema": {"type": "string"},
+                "schema": schema,
             }
         )
     return params
+
+
+def is_collection_entry(entry: Dict[str, object]) -> bool:
+    roles = entry.get("roles", [])
+    if isinstance(roles, list) and any(isinstance(r, str) and "Collection::" in r for r in roles):
+        return True
+    path = entry.get("path", "")
+    if isinstance(path, str) and path in ("/queues", "/users", "/groups", "/tickets", "/assets", "/articles"):
+        return True
+    return False
+
+
+def query_parameter_refs(entry: Dict[str, object], method: str, resource_query_params: Dict[str, List[str]]) -> List[Dict[str, str]]:
+    if method not in ("GET", "HEAD"):
+        return []
+
+    resources = entry.get("resources", [])
+    discovered: Set[str] = set()
+    if isinstance(resources, list):
+        for resource in resources:
+            if isinstance(resource, str):
+                for p in resource_query_params.get(resource, []):
+                    discovered.add(p)
+
+    refs = []
+    for name in sorted(discovered):
+        refs.append({"$ref": f"#/components/parameters/{name}"})
+    return refs
+
+
+def request_body_schema_for_operation(entry: Dict[str, object], evidence: Optional[Dict[str, object]]) -> Dict[str, object]:
+    roles = entry.get("roles", []) if isinstance(entry.get("roles", []), list) else []
+
+    if evidence and evidence.get("request_body") == "json":
+        return {
+            "description": "Observed in RT tests as JSON request body.",
+            "oneOf": [
+                {"type": "object", "additionalProperties": True},
+                {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            ],
+        }
+
+    if any(isinstance(r, str) and "Collection::QueryByJSON" in r for r in roles):
+        return {
+            "description": "JSON search filter list.",
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/SearchFilter"},
+        }
+
+    if any(isinstance(r, str) and "RequestBodyIsJSON" in r for r in roles):
+        return {
+            "description": "JSON payload.",
+            "oneOf": [
+                {"type": "object", "additionalProperties": True},
+                {"type": "array", "items": {"type": "string"}},
+            ],
+        }
+
+    return {
+        "type": "object",
+        "description": "Generic JSON payload placeholder; refine in later phases.",
+        "additionalProperties": True,
+    }
+
+
+def media_types_for_entry(entry: Dict[str, object], resource_content_types: Dict[str, Dict[str, List[str]]]) -> Dict[str, List[str]]:
+    accepted: Set[str] = set()
+    provided: Set[str] = set()
+    resources = entry.get("resources", [])
+    if isinstance(resources, list):
+        for resource in resources:
+            if not isinstance(resource, str):
+                continue
+            ct = resource_content_types.get(resource, {})
+            if isinstance(ct, dict):
+                accepted.update(ct.get("accepted", []))
+                provided.update(ct.get("provided", []))
+    return {
+        "accepted": sorted(accepted),
+        "provided": sorted(provided),
+    }
+
+
+def schema_for_request_media_type(media_type: str, default_json_schema: Dict[str, object]) -> Dict[str, object]:
+    if media_type == "application/json":
+        return default_json_schema
+    if media_type in ("text/plain", "text/html"):
+        return {"type": "string"}
+    if media_type == "multipart/form-data":
+        return {"type": "object", "additionalProperties": True}
+    return {"type": "string"}
 
 
 def response_for_method(method: str) -> Tuple[str, Dict[str, object]]:
@@ -779,6 +949,8 @@ def build_openapi(
     runtime_status_by_operation: Dict[str, List[str]],
     head_405_operations: List[str],
     runtime_meta: Dict[str, object],
+    resource_query_params: Dict[str, List[str]],
+    resource_content_types: Dict[str, Dict[str, List[str]]],
 ) -> Dict:
     paths_obj: Dict[str, Dict[str, object]] = {}
     evidence_index = index_test_evidence(test_evidence)
@@ -804,6 +976,7 @@ def build_openapi(
                 status_code: status_response,
                 "default": {"$ref": "#/components/responses/Error"},
             }
+            media_types = media_types_for_entry(entry, resource_content_types)
 
             evidence = find_evidence_for_operation(evidence_index, path, method)
             if evidence:
@@ -839,36 +1012,40 @@ def build_openapi(
                 "x-rt-route-regex": entry["regex_patterns"],
             }
 
+            query_refs = query_parameter_refs(entry, method, resource_query_params)
+            if query_refs:
+                operation_obj["parameters"] = query_refs
+
+            if method in ("GET", "HEAD") and "200" in responses:
+                response_media_types = media_types.get("provided") or ["application/json"]
+                response_content = {
+                    media: {
+                        "schema": {
+                            "$ref": "#/components/schemas/CollectionResponse"
+                            if is_collection_entry(entry)
+                            else "#/components/schemas/RecordObject"
+                        }
+                    }
+                    for media in response_media_types
+                }
+                operation_obj["responses"]["200"] = {
+                    "description": "OK",
+                    "content": response_content,
+                }
+
             if method in ("POST", "PUT", "PATCH"):
+                default_json_schema = request_body_schema_for_operation(entry, evidence)
+                request_media_types = media_types.get("accepted") or ["application/json"]
+                request_content = {
+                    media: {"schema": schema_for_request_media_type(media, default_json_schema)}
+                    for media in request_media_types
+                }
                 operation_obj["requestBody"] = {
                     "required": False,
-                    "content": {
-                        "application/json": {
-                            "schema": {
-                                "type": "object",
-                                "description": "Generic JSON payload placeholder; refine in later phases.",
-                                "additionalProperties": True,
-                            }
-                        }
-                    },
+                    "content": request_content,
                 }
 
             if evidence:
-                if evidence.get("request_body") == "json" and method in ("POST", "PUT", "PATCH"):
-                    operation_obj["requestBody"] = {
-                        "required": False,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "description": "Observed in RT tests as JSON request body.",
-                                    "oneOf": [
-                                        {"type": "object", "additionalProperties": True},
-                                        {"type": "array", "items": {"type": "object", "additionalProperties": True}},
-                                    ],
-                                }
-                            }
-                        },
-                    }
 
                 operation_obj["x-rt-test-evidence"] = {
                     "calls": evidence.get("calls", 0),
@@ -881,6 +1058,9 @@ def build_openapi(
                     "status_codes": runtime_codes,
                     "source": runtime_meta.get("source", "out/probe-analysis.json"),
                 }
+
+            if media_types.get("accepted") or media_types.get("provided"):
+                operation_obj["x-rt-content-types"] = media_types
 
             path_item[method.lower()] = operation_obj
 
@@ -904,6 +1084,145 @@ def build_openapi(
         "paths": paths_obj,
         "x-rt-runtime-overrides": runtime_meta,
         "components": {
+            "parameters": {
+                "page": {
+                    "name": "page",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "integer", "minimum": 1},
+                    "description": "Page number.",
+                },
+                "per_page": {
+                    "name": "per_page",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "integer", "minimum": 1},
+                    "description": "Items per page.",
+                },
+                "order": {
+                    "name": "order",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "string", "enum": ["ASC", "DESC", "asc", "desc"]},
+                    "description": "Sort order.",
+                },
+                "orderby": {
+                    "name": "orderby",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "string"},
+                    "description": "Field(s) used for sorting.",
+                },
+                "find_disabled_rows": {
+                    "name": "find_disabled_rows",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "boolean"},
+                    "description": "Include disabled rows in results.",
+                },
+                "fields": {
+                    "name": "fields",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "string"},
+                    "description": "Comma-separated list of fields to return.",
+                },
+                "query": {
+                    "name": "query",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "string"},
+                    "description": "SQL-like search query.",
+                },
+                "simple": {
+                    "name": "simple",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "boolean"},
+                    "description": "Enable simple query parsing.",
+                },
+                "category": {
+                    "name": "category",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "string"},
+                    "description": "Category selector.",
+                },
+                "group": {
+                    "name": "group",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "integer", "format": "int64"},
+                    "description": "Group identifier.",
+                },
+                "user": {
+                    "name": "user",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "string"},
+                    "description": "User identifier or name.",
+                },
+                "type": {
+                    "name": "type",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "string"},
+                    "description": "Lifecycle type.",
+                },
+            },
+            "schemas": {
+                "SearchFilter": {
+                    "type": "object",
+                    "properties": {
+                        "field": {"type": "string"},
+                        "operator": {"type": "string"},
+                        "value": {},
+                        "entry_aggregator": {"type": "string"},
+                    },
+                    "required": ["field", "value"],
+                    "additionalProperties": True,
+                },
+                "Hyperlink": {
+                    "type": "object",
+                    "properties": {
+                        "ref": {"type": "string"},
+                        "type": {"type": "string"},
+                        "id": {},
+                        "_url": {"type": "string"},
+                    },
+                    "additionalProperties": True,
+                },
+                "RecordObject": {
+                    "type": "object",
+                    "properties": {
+                        "id": {},
+                        "type": {"type": "string"},
+                        "_url": {"type": "string"},
+                        "_hyperlinks": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/Hyperlink"},
+                        },
+                    },
+                    "additionalProperties": True,
+                },
+                "CollectionResponse": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                        "total": {"type": ["integer", "null"]},
+                        "per_page": {"type": "integer"},
+                        "page": {"type": "integer"},
+                        "next_page": {"type": ["string", "null"]},
+                        "prev_page": {"type": ["string", "null"]},
+                        "items": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/RecordObject"},
+                        },
+                    },
+                    "required": ["count", "items"],
+                    "additionalProperties": True,
+                },
+            },
             "securitySchemes": {
                 "tokenAuth": {
                     "type": "http",
@@ -1009,6 +1328,8 @@ def main() -> None:
         raise SystemExit(f"Missing resource directory: {resource_dir}")
 
     route_defs = collect_route_defs(resource_dir)
+    resource_query_params = collect_resource_query_params(resource_dir)
+    resource_content_types = collect_resource_content_types(resource_dir)
     test_hints = collect_test_method_hints(test_dir)
     inventory = build_inventory(route_defs, test_hints)
     test_evidence = collect_test_evidence(test_dir)
@@ -1049,6 +1370,8 @@ def main() -> None:
         runtime_status_by_operation,
         head_405_operations,
         runtime_meta,
+        resource_query_params,
+        resource_content_types,
     )
     spec_json_path = spec_dir / "openapi.json"
     spec_yaml_path = spec_dir / "openapi.yaml"

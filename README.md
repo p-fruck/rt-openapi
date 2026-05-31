@@ -88,3 +88,6 @@ make phase3
 - RT tests are parsed to capture request method/path usage, asserted status codes, and JSON-body hints.
 - Runtime probe analysis is consumed during extraction to add explicit observed status codes and prune `HEAD` operations that consistently return `405`.
 - The OpenAPI output is still schema-light by design, but now includes test evidence metadata plus runtime evidence metadata.
+- Query parameters are source-derived from resource classes and emitted as reusable OpenAPI component parameters.
+- Collection and record GET responses now reference reusable schemas (`CollectionResponse`, `RecordObject`).
+- Request/response media types are inferred from resource `content_types_accepted`/`content_types_provided` callbacks and included per operation.
