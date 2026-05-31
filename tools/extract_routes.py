@@ -722,9 +722,67 @@ def find_evidence_for_operation(
     return None
 
 
-def build_openapi(inventory: Dict, rt_commit: str, test_evidence: Dict[str, object]) -> Dict:
+def load_probe_analysis(path: Path) -> Dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def index_runtime_probe_overrides(
+    probe_analysis: Dict[str, object],
+) -> Tuple[Dict[str, List[str]], List[str], Dict[str, object]]:
+    status_by_operation: Dict[str, set] = {}
+    head_405_ops: set = set()
+
+    undocumented = probe_analysis.get("undocumented_status", []) if isinstance(probe_analysis, dict) else []
+    if isinstance(undocumented, list):
+        for item in undocumented:
+            if not isinstance(item, dict):
+                continue
+            op_id = item.get("operation_id")
+            status = item.get("status")
+            if not isinstance(op_id, str):
+                continue
+            status_str = str(status)
+            if re.fullmatch(r"\d{3}", status_str):
+                status_by_operation.setdefault(op_id, set()).add(status_str)
+
+    head_405 = probe_analysis.get("head_method_not_allowed", []) if isinstance(probe_analysis, dict) else []
+    if isinstance(head_405, list):
+        for item in head_405:
+            if not isinstance(item, dict):
+                continue
+            op_id = item.get("operation_id")
+            if isinstance(op_id, str):
+                head_405_ops.add(op_id)
+
+    meta = {
+        "source": "out/probe-analysis.json",
+        "runtime_status_operation_count": len(status_by_operation),
+        "head_405_operation_count": len(head_405_ops),
+    }
+
+    return (
+        {op: sorted(codes, key=int) for op, codes in status_by_operation.items()},
+        sorted(head_405_ops),
+        meta,
+    )
+
+
+def build_openapi(
+    inventory: Dict,
+    rt_commit: str,
+    test_evidence: Dict[str, object],
+    runtime_status_by_operation: Dict[str, List[str]],
+    head_405_operations: List[str],
+    runtime_meta: Dict[str, object],
+) -> Dict:
     paths_obj: Dict[str, Dict[str, object]] = {}
     evidence_index = index_test_evidence(test_evidence)
+    head_405_set = set(head_405_operations)
 
     for entry in inventory["paths"]:
         path = entry["path"]
@@ -736,6 +794,11 @@ def build_openapi(inventory: Dict, rt_commit: str, test_evidence: Dict[str, obje
             path_item["parameters"] = params
 
         for method in methods:
+            operation_id = op_id(method, path)
+            if method == "HEAD" and operation_id in head_405_set:
+                # Deterministic runtime pruning: operation consistently returned 405 in probes.
+                continue
+
             status_code, status_response = response_for_method(method)
             responses: Dict[str, object] = {
                 status_code: status_response,
@@ -751,8 +814,16 @@ def build_openapi(inventory: Dict, rt_commit: str, test_evidence: Dict[str, obje
                             if code not in responses:
                                 responses[code] = {"description": status_description(code)}
 
+            runtime_codes = runtime_status_by_operation.get(operation_id, [])
+            for code in runtime_codes:
+                if code not in responses:
+                    responses[code] = {
+                        "description": status_description(code),
+                        "x-rt-runtime-observed": True,
+                    }
+
             operation_obj: Dict[str, object] = {
-                "operationId": op_id(method, path),
+                "operationId": operation_id,
                 "tags": [tag_for_path(path)],
                 "description": (
                     "Auto-generated RT REST2 operation skeleton. "
@@ -805,7 +876,17 @@ def build_openapi(inventory: Dict, rt_commit: str, test_evidence: Dict[str, obje
                     "files": evidence.get("files", []),
                 }
 
+            if runtime_codes:
+                operation_obj["x-rt-runtime-evidence"] = {
+                    "status_codes": runtime_codes,
+                    "source": runtime_meta.get("source", "out/probe-analysis.json"),
+                }
+
             path_item[method.lower()] = operation_obj
+
+        if len(path_item) == 1 and "parameters" in path_item:
+            # Every operation on this path was pruned.
+            continue
 
         paths_obj[path] = path_item
 
@@ -815,12 +896,13 @@ def build_openapi(inventory: Dict, rt_commit: str, test_evidence: Dict[str, obje
             "title": "RT REST 2.0 API",
             "version": f"0.1.0-rt-{rt_commit[:12]}",
             "description": (
-                "Phase-2 deterministic skeleton generated from RT source route regexes, "
-                "allowed_methods declarations, and RT test evidence for status/request-body hints."
+                "Phase-3 deterministic skeleton generated from RT source route regexes, "
+                "RT test evidence, and runtime probe-driven response/method refinements."
             ),
         },
         "servers": [{"url": "http://localhost", "description": "Local RT instance"}],
         "paths": paths_obj,
+        "x-rt-runtime-overrides": runtime_meta,
         "components": {
             "securitySchemes": {
                 "tokenAuth": {
@@ -930,6 +1012,8 @@ def main() -> None:
     test_hints = collect_test_method_hints(test_dir)
     inventory = build_inventory(route_defs, test_hints)
     test_evidence = collect_test_evidence(test_dir)
+    probe_analysis = load_probe_analysis(workspace / "out" / "probe-analysis.json")
+    runtime_status_by_operation, head_405_operations, runtime_meta = index_runtime_probe_overrides(probe_analysis)
 
     rt_commit = read_rt_commit(rt_dir)
     inventory["meta"]["rt_commit"] = rt_commit
@@ -941,10 +1025,31 @@ def main() -> None:
 
     inventory_path = out_dir / "endpoint-inventory.json"
     test_evidence_path = out_dir / "test-evidence.json"
+    runtime_overrides_path = out_dir / "runtime-overrides.json"
     inventory_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     test_evidence_path.write_text(json.dumps(test_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    runtime_overrides_path.write_text(
+        json.dumps(
+            {
+                "runtime_status_by_operation": runtime_status_by_operation,
+                "head_405_operations": head_405_operations,
+                "meta": runtime_meta,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
-    openapi = build_openapi(inventory, rt_commit, test_evidence)
+    openapi = build_openapi(
+        inventory,
+        rt_commit,
+        test_evidence,
+        runtime_status_by_operation,
+        head_405_operations,
+        runtime_meta,
+    )
     spec_json_path = spec_dir / "openapi.json"
     spec_yaml_path = spec_dir / "openapi.yaml"
     spec_json_path.write_text(json.dumps(openapi, indent=2, sort_keys=False) + "\n", encoding="utf-8")
@@ -957,6 +1062,7 @@ def main() -> None:
         "paths": inventory["meta"]["path_count"],
         "inventory": str(inventory_path.relative_to(workspace)),
         "test_evidence": str(test_evidence_path.relative_to(workspace)),
+        "runtime_overrides": str(runtime_overrides_path.relative_to(workspace)),
         "openapi_json": str(spec_json_path.relative_to(workspace)),
         "openapi_yaml": str(spec_yaml_path.relative_to(workspace)),
     }

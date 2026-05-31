@@ -6,6 +6,7 @@ This repository builds a deterministic OpenAPI specification baseline for RT RES
 
 - Complete endpoint inventory: `out/endpoint-inventory.json`
 - Deterministic test evidence map: `out/test-evidence.json`
+- Runtime override map from probe analysis: `out/runtime-overrides.json`
 - OpenAPI skeleton (methods + path params + base security):
   - `spec/openapi.json`
   - `spec/openapi.yaml`
@@ -34,12 +35,12 @@ This runs safe read-only probes (GET/HEAD) against generated operations and writ
 make probe
 ```
 
-By default, the probe script auto-loads `.env` from the workspace root and auto-selects auth mode from available credentials (`RT_TOKEN`, `RT_USERNAME` + `RT_PASSWORD`, or `RT_COOKIE`) and runs agains the configured baseurl (falls back to `RT_SERVER`).
+By default, the probe script auto-loads `.env` from the workspace root and auto-selects auth mode from available credentials (`RT_TOKEN`, `RT_USERNAME` + `RT_PASSWORD`, or `RT_COOKIE`). It uses the configured base URL and falls back to `RT_SERVER` when needed.
 
-python3 tools/probe_live_rt.py --workspace 
 Optional auth examples:
 
-```bash. --auth-mode token --token "1-14-..." --base-url "http://localhost"
+```bash
+python3 tools/probe_live_rt.py --workspace . --auth-mode token --token "1-14-..." --base-url "http://localhost"
 python3 tools/probe_live_rt.py --workspace . --auth-mode basic --user test --password secret --base-url "http://localhost"
 ```
 
@@ -56,6 +57,24 @@ Outputs:
 - `out/probe-analysis.json`
 - `out/coverage-report.md`
 
+Create or refresh baseline snapshot:
+
+```bash
+make snapshot
+```
+
+Generate delta from current analysis vs baseline:
+
+```bash
+make delta
+```
+
+Delta outputs:
+
+- `out/probe-delta.json`
+- `out/probe-delta.md`
+- Baseline file: `out/probe-analysis.baseline.json`
+
 One-shot refresh for generation + probing + analysis:
 
 ```bash
@@ -67,4 +86,5 @@ make phase3
 - Routes are extracted from `lib/RT/REST2/Resource/*.pm` `dispatch_rules` regex declarations.
 - Methods are extracted from `allowed_methods` when present, with deterministic fallbacks and test-based hints from `t/rest2/*.t`.
 - RT tests are parsed to capture request method/path usage, asserted status codes, and JSON-body hints.
-- The OpenAPI output is still schema-light by design, but now includes observed response status codes and operation-level test evidence metadata.
+- Runtime probe analysis is consumed during extraction to add explicit observed status codes and prune `HEAD` operations that consistently return `405`.
+- The OpenAPI output is still schema-light by design, but now includes test evidence metadata plus runtime evidence metadata.

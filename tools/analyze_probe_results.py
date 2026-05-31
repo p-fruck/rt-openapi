@@ -218,9 +218,203 @@ def render_markdown(analysis: Dict[str, object], probe: Dict[str, object]) -> st
     return "\n".join(lines) + "\n"
 
 
+def to_undoc_set(analysis: Dict[str, object]) -> set:
+    out = set()
+    items = analysis.get("undocumented_status", [])
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        op = str(item.get("operation_id", ""))
+        status = str(item.get("status", ""))
+        if op and status:
+            out.add((op, status))
+    return out
+
+
+def to_head405_set(analysis: Dict[str, object]) -> set:
+    out = set()
+    items = analysis.get("head_method_not_allowed", [])
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        op = str(item.get("operation_id", ""))
+        if op:
+            out.add(op)
+    return out
+
+
+def to_server5xx_set(analysis: Dict[str, object]) -> set:
+    out = set()
+    items = analysis.get("server_errors", [])
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        op = str(item.get("operation_id", ""))
+        status = str(item.get("status", ""))
+        if op and status:
+            out.add((op, status))
+    return out
+
+
+def build_delta(current: Dict[str, object], previous: Dict[str, object]) -> Dict[str, object]:
+    cur_undoc = to_undoc_set(current)
+    prev_undoc = to_undoc_set(previous)
+    cur_head405 = to_head405_set(current)
+    prev_head405 = to_head405_set(previous)
+    cur_5xx = to_server5xx_set(current)
+    prev_5xx = to_server5xx_set(previous)
+
+    return {
+        "summary": {
+            "undocumented_status_added": len(cur_undoc - prev_undoc),
+            "undocumented_status_removed": len(prev_undoc - cur_undoc),
+            "head_405_added": len(cur_head405 - prev_head405),
+            "head_405_removed": len(prev_head405 - cur_head405),
+            "server_5xx_added": len(cur_5xx - prev_5xx),
+            "server_5xx_removed": len(prev_5xx - cur_5xx),
+        },
+        "undocumented_status": {
+            "added": [
+                {"operation_id": op, "status": status}
+                for op, status in sorted(cur_undoc - prev_undoc)
+            ],
+            "removed": [
+                {"operation_id": op, "status": status}
+                for op, status in sorted(prev_undoc - cur_undoc)
+            ],
+        },
+        "head_method_not_allowed": {
+            "added": sorted(cur_head405 - prev_head405),
+            "removed": sorted(prev_head405 - cur_head405),
+        },
+        "server_errors": {
+            "added": [
+                {"operation_id": op, "status": status}
+                for op, status in sorted(cur_5xx - prev_5xx)
+            ],
+            "removed": [
+                {"operation_id": op, "status": status}
+                for op, status in sorted(prev_5xx - cur_5xx)
+            ],
+        },
+    }
+
+
+def render_delta_markdown(delta: Dict[str, object]) -> str:
+    summary = delta.get("summary", {}) if isinstance(delta, dict) else {}
+    lines: List[str] = []
+    lines.append("# Probe Delta Report")
+    lines.append("")
+    lines.append("## Summary")
+    lines.append("")
+    lines.append(f"- Undocumented status added: `{summary.get('undocumented_status_added', 0)}`")
+    lines.append(f"- Undocumented status removed: `{summary.get('undocumented_status_removed', 0)}`")
+    lines.append(f"- HEAD 405 added: `{summary.get('head_405_added', 0)}`")
+    lines.append(f"- HEAD 405 removed: `{summary.get('head_405_removed', 0)}`")
+    lines.append(f"- Server 5xx added: `{summary.get('server_5xx_added', 0)}`")
+    lines.append(f"- Server 5xx removed: `{summary.get('server_5xx_removed', 0)}`")
+    lines.append("")
+
+    undoc = delta.get("undocumented_status", {}) if isinstance(delta, dict) else {}
+    added_undoc = undoc.get("added", []) if isinstance(undoc, dict) else []
+    removed_undoc = undoc.get("removed", []) if isinstance(undoc, dict) else []
+
+    lines.append("## Undocumented Status Added")
+    lines.append("")
+    if added_undoc:
+        for item in added_undoc[:40]:
+            lines.append(f"- `{item.get('operation_id')}` -> `{item.get('status')}`")
+    else:
+        lines.append("- None")
+    lines.append("")
+
+    lines.append("## Undocumented Status Removed")
+    lines.append("")
+    if removed_undoc:
+        for item in removed_undoc[:40]:
+            lines.append(f"- `{item.get('operation_id')}` -> `{item.get('status')}`")
+    else:
+        lines.append("- None")
+    lines.append("")
+
+    head = delta.get("head_method_not_allowed", {}) if isinstance(delta, dict) else {}
+    added_head = head.get("added", []) if isinstance(head, dict) else []
+    removed_head = head.get("removed", []) if isinstance(head, dict) else []
+
+    lines.append("## HEAD 405 Added")
+    lines.append("")
+    if added_head:
+        for op in added_head[:40]:
+            lines.append(f"- `{op}`")
+    else:
+        lines.append("- None")
+    lines.append("")
+
+    lines.append("## HEAD 405 Removed")
+    lines.append("")
+    if removed_head:
+        for op in removed_head[:40]:
+            lines.append(f"- `{op}`")
+    else:
+        lines.append("- None")
+    lines.append("")
+
+    sx = delta.get("server_errors", {}) if isinstance(delta, dict) else {}
+    added_sx = sx.get("added", []) if isinstance(sx, dict) else []
+    removed_sx = sx.get("removed", []) if isinstance(sx, dict) else []
+
+    lines.append("## Server 5xx Added")
+    lines.append("")
+    if added_sx:
+        for item in added_sx[:40]:
+            lines.append(f"- `{item.get('operation_id')}` -> `{item.get('status')}`")
+    else:
+        lines.append("- None")
+    lines.append("")
+
+    lines.append("## Server 5xx Removed")
+    lines.append("")
+    if removed_sx:
+        for item in removed_sx[:40]:
+            lines.append(f"- `{item.get('operation_id')}` -> `{item.get('status')}`")
+    else:
+        lines.append("- None")
+
+    return "\n".join(lines) + "\n"
+
+
+def write_snapshot(current: Dict[str, object], workspace: Path) -> Path:
+    baseline_path = workspace / "out" / "probe-analysis.baseline.json"
+    baseline_path.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return baseline_path
+
+
+def write_delta(current: Dict[str, object], workspace: Path) -> Tuple[Path, Path]:
+    baseline_path = workspace / "out" / "probe-analysis.baseline.json"
+    if not baseline_path.exists():
+        raise SystemExit(f"Missing baseline file: {baseline_path}")
+
+    previous = load_json(baseline_path)
+    delta = build_delta(current, previous)
+
+    delta_json_path = workspace / "out" / "probe-delta.json"
+    delta_md_path = workspace / "out" / "probe-delta.md"
+    delta_json_path.write_text(json.dumps(delta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    delta_md_path.write_text(render_delta_markdown(delta), encoding="utf-8")
+    return delta_json_path, delta_md_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze RT probe results against generated OpenAPI")
     parser.add_argument("--workspace", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument("--snapshot", action="store_true", help="Write current analysis as baseline snapshot")
+    parser.add_argument("--delta", action="store_true", help="Diff current analysis against baseline snapshot")
     args = parser.parse_args()
 
     workspace = Path(args.workspace).resolve()
@@ -234,11 +428,26 @@ def main() -> None:
     analysis_path.write_text(json.dumps(analysis, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     report_path.write_text(render_markdown(analysis, probe), encoding="utf-8")
 
+    baseline_rel = None
+    delta_json_rel = None
+    delta_md_rel = None
+    if args.snapshot:
+        baseline_path = write_snapshot(analysis, workspace)
+        baseline_rel = str(baseline_path.relative_to(workspace))
+
+    if args.delta:
+        delta_json_path, delta_md_path = write_delta(analysis, workspace)
+        delta_json_rel = str(delta_json_path.relative_to(workspace))
+        delta_md_rel = str(delta_md_path.relative_to(workspace))
+
     print(
         json.dumps(
             {
                 "probe_analysis": str(analysis_path.relative_to(workspace)),
                 "coverage_report": str(report_path.relative_to(workspace)),
+                "baseline_snapshot": baseline_rel,
+                "probe_delta_json": delta_json_rel,
+                "probe_delta_md": delta_md_rel,
                 "summary": analysis.get("summary", {}),
             },
             indent=2,
