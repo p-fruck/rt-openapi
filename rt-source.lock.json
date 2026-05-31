@@ -6,7 +6,7 @@
   },
   "generator": {
     "name": "extract_routes.py",
-    "phase": "phase-1 endpoint inventory + openapi skeleton"
+    "phase": "phase-2 endpoint inventory + openapi skeleton + test evidence enrichment"
   },
   "generated_at": "2026-05-31"
 }

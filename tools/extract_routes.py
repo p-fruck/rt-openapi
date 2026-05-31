@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 HTTP_ORDER = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 HTTP_SET = set(HTTP_ORDER)
+TEST_HTTP_CALL = "get|head|delete|post|post_json|put|put_json"
 
 
 @dataclass(frozen=True)
@@ -347,6 +348,188 @@ def collect_test_method_hints(test_dir: Path) -> Dict[str, List[str]]:
     return {k: sorted(v, key=HTTP_ORDER.index) for k, v in hints.items()}
 
 
+def split_top_level_args(expr: str) -> List[str]:
+    parts: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if ch == "\\" and i + 1 < len(expr):
+            cur.append(expr[i : i + 2])
+            i += 2
+            continue
+
+        if not in_double and ch == "'":
+            in_single = not in_single
+            cur.append(ch)
+            i += 1
+            continue
+
+        if not in_single and ch == '"':
+            in_double = not in_double
+            cur.append(ch)
+            i += 1
+            continue
+
+        if not in_single and not in_double:
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth = max(0, depth - 1)
+            elif ch == "," and depth == 0:
+                part = "".join(cur).strip()
+                if part:
+                    parts.append(part)
+                cur = []
+                i += 1
+                continue
+
+        cur.append(ch)
+        i += 1
+
+    tail = "".join(cur).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def extract_string_literals(expr: str) -> List[str]:
+    literals: List[str] = []
+    for quote in ("'", '"'):
+        pattern = re.compile(rf"{re.escape(quote)}((?:\\.|[^{re.escape(quote)}])*){re.escape(quote)}")
+        for m in pattern.finditer(expr):
+            literals.append(m.group(1))
+    return literals
+
+
+def normalize_test_path(path_expr: str) -> Optional[str]:
+    expr = " ".join(path_expr.strip().split())
+    if "url_for_hypermedia" in expr:
+        return None
+
+    literals = extract_string_literals(expr)
+    if not literals and "$rest_base_path" not in expr:
+        return None
+
+    combined = "".join(literals)
+    combined = combined.replace("$rest_base_path", "/REST/2.0")
+    if "$rest_base_path" in expr and "/REST/2.0" not in combined:
+        combined = "/REST/2.0" + combined
+
+    combined = re.sub(r"/REST/2\.0(?:/REST/2\.0)+", "/REST/2.0", combined)
+    rest_pos = combined.find("/REST/2.0")
+    if rest_pos >= 0:
+        combined = combined[rest_pos:]
+
+    combined = combined.lstrip(",")
+    combined = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", r"{\1}", combined)
+    combined = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", r"{\1}", combined)
+    combined = combined.replace("\\/", "/")
+
+    if "/REST/2.0" not in combined:
+        return None
+
+    path = combined.split("/REST/2.0", 1)[1]
+    if not path:
+        path = "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    path = path.split("?", 1)[0]
+    path = re.sub(r"/+", "/", path)
+    path = re.sub(r"/+$", "", path) or "/"
+    return path
+
+
+def collect_test_evidence(test_dir: Path) -> Dict[str, object]:
+    if not test_dir.exists():
+        return {"operations": []}
+
+    operation_map: Dict[Tuple[str, str], Dict[str, object]] = {}
+    call_start = re.compile(rf"(?:my\s+)?\$(\w+)\s*=\s*\$mech->({TEST_HTTP_CALL})\s*\(")
+    status_line = re.compile(r"\bis\s*\(\s*\$(\w+)->code\s*,\s*(\d{3})\s*\)")
+
+    for file in sorted(test_dir.glob("*.t")):
+        lines = file.read_text(encoding="utf-8", errors="replace").splitlines()
+        pending: Dict[str, Dict[str, object]] = {}
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            m = call_start.search(line)
+            if m:
+                var_name = m.group(1)
+                method_name = m.group(2)
+
+                call_lines = [line[m.start() :]]
+                paren_balance = call_lines[0].count("(") - call_lines[0].count(")")
+                j = i + 1
+                while j < len(lines) and (paren_balance > 0 or ";" not in call_lines[-1]):
+                    call_lines.append(lines[j])
+                    paren_balance += lines[j].count("(") - lines[j].count(")")
+                    if lines[j].strip().endswith(";") and paren_balance <= 0:
+                        break
+                    j += 1
+
+                call_text = "\n".join(call_lines)
+                open_idx = call_text.find("(")
+                close_idx = call_text.rfind(")")
+                args_text = call_text[open_idx + 1 : close_idx] if open_idx >= 0 and close_idx > open_idx else ""
+                args = split_top_level_args(args_text)
+                path_expr = args[0] if args else ""
+                path = normalize_test_path(path_expr)
+
+                http = perl_method_to_http(method_name)
+                if path and http:
+                    key = (path, http)
+                    entry = operation_map.setdefault(
+                        key,
+                        {
+                            "path": path,
+                            "method": http,
+                            "files": set(),
+                            "status_codes": set(),
+                            "request_body": "json" if method_name.endswith("_json") else "unknown",
+                            "calls": 0,
+                        },
+                    )
+                    entry["files"].add(str(file))
+                    entry["calls"] += 1
+                    if method_name.endswith("_json"):
+                        entry["request_body"] = "json"
+
+                    pending[var_name] = {"key": key, "line": i + 1}
+
+                i = max(i + 1, j)
+
+            status = status_line.search(line)
+            if status:
+                var_name = status.group(1)
+                code = status.group(2)
+                req = pending.get(var_name)
+                if req and abs((i + 1) - int(req["line"])) <= 50:
+                    key = req["key"]
+                    operation_map[key]["status_codes"].add(code)
+
+            i += 1
+
+    operations = []
+    for key in sorted(operation_map):
+        op = operation_map[key]
+        operations.append(
+            {
+                "path": op["path"],
+                "method": op["method"],
+                "calls": op["calls"],
+                "request_body": op["request_body"],
+                "status_codes": sorted(op["status_codes"]),
+                "files": sorted(op["files"]),
+            }
+        )
+    return {"operations": operations}
+
+
 def template_to_regex(path_template: str) -> re.Pattern:
     escaped = re.escape(path_template)
     escaped = re.sub(r"\\\{[^}]+\\\}", r"[^/]+", escaped)
@@ -479,8 +662,69 @@ def response_for_method(method: str) -> Tuple[str, Dict[str, object]]:
     return "200", {"description": "OK"}
 
 
-def build_openapi(inventory: Dict, rt_commit: str) -> Dict:
+def status_description(code: str) -> str:
+    if code == "200":
+        return "OK"
+    if code == "201":
+        return "Created"
+    if code == "202":
+        return "Accepted"
+    if code == "204":
+        return "No Content"
+    if code == "400":
+        return "Bad Request"
+    if code == "401":
+        return "Unauthorized"
+    if code == "403":
+        return "Forbidden"
+    if code == "404":
+        return "Not Found"
+    if code == "409":
+        return "Conflict"
+    if code == "422":
+        return "Unprocessable Content"
+    if code == "500":
+        return "Internal Server Error"
+    return "Response"
+
+
+def equivalent_path_templates(path_a: str, path_b: str) -> bool:
+    def to_shape(path: str) -> str:
+        return re.sub(r"\{[^}]+\}", "{}", path)
+
+    return to_shape(path_a) == to_shape(path_b)
+
+
+def index_test_evidence(test_evidence: Dict[str, object]) -> Dict[Tuple[str, str], Dict[str, object]]:
+    index: Dict[Tuple[str, str], Dict[str, object]] = {}
+    ops = test_evidence.get("operations", []) if isinstance(test_evidence, dict) else []
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        path = op.get("path")
+        method = op.get("method")
+        if isinstance(path, str) and isinstance(method, str) and method in HTTP_SET:
+            index[(path, method)] = op
+    return index
+
+
+def find_evidence_for_operation(
+    evidence_index: Dict[Tuple[str, str], Dict[str, object]],
+    op_path: str,
+    method: str,
+) -> Optional[Dict[str, object]]:
+    direct = evidence_index.get((op_path, method))
+    if direct:
+        return direct
+    for (path, meth), op in evidence_index.items():
+        if meth == method and equivalent_path_templates(path, op_path):
+            return op
+    return None
+
+
+def build_openapi(inventory: Dict, rt_commit: str, test_evidence: Dict[str, object]) -> Dict:
     paths_obj: Dict[str, Dict[str, object]] = {}
+    evidence_index = index_test_evidence(test_evidence)
 
     for entry in inventory["paths"]:
         path = entry["path"]
@@ -493,17 +737,28 @@ def build_openapi(inventory: Dict, rt_commit: str) -> Dict:
 
         for method in methods:
             status_code, status_response = response_for_method(method)
-            path_item[method.lower()] = {
+            responses: Dict[str, object] = {
+                status_code: status_response,
+                "default": {"$ref": "#/components/responses/Error"},
+            }
+
+            evidence = find_evidence_for_operation(evidence_index, path, method)
+            if evidence:
+                observed = evidence.get("status_codes", [])
+                if isinstance(observed, list):
+                    for code in observed:
+                        if isinstance(code, str) and re.fullmatch(r"\d{3}", code):
+                            if code not in responses:
+                                responses[code] = {"description": status_description(code)}
+
+            operation_obj: Dict[str, object] = {
                 "operationId": op_id(method, path),
                 "tags": [tag_for_path(path)],
                 "description": (
                     "Auto-generated RT REST2 operation skeleton. "
                     "Schema and examples to be enriched in later phases."
                 ),
-                "responses": {
-                    status_code: status_response,
-                    "default": {"$ref": "#/components/responses/Error"},
-                },
+                "responses": responses,
                 "security": [
                     {"tokenAuth": []},
                     {"basicAuth": []},
@@ -513,6 +768,45 @@ def build_openapi(inventory: Dict, rt_commit: str) -> Dict:
                 "x-rt-route-regex": entry["regex_patterns"],
             }
 
+            if method in ("POST", "PUT", "PATCH"):
+                operation_obj["requestBody"] = {
+                    "required": False,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "description": "Generic JSON payload placeholder; refine in later phases.",
+                                "additionalProperties": True,
+                            }
+                        }
+                    },
+                }
+
+            if evidence:
+                if evidence.get("request_body") == "json" and method in ("POST", "PUT", "PATCH"):
+                    operation_obj["requestBody"] = {
+                        "required": False,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "description": "Observed in RT tests as JSON request body.",
+                                    "oneOf": [
+                                        {"type": "object", "additionalProperties": True},
+                                        {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                                    ],
+                                }
+                            }
+                        },
+                    }
+
+                operation_obj["x-rt-test-evidence"] = {
+                    "calls": evidence.get("calls", 0),
+                    "status_codes": evidence.get("status_codes", []),
+                    "files": evidence.get("files", []),
+                }
+
+            path_item[method.lower()] = operation_obj
+
         paths_obj[path] = path_item
 
     return {
@@ -521,8 +815,8 @@ def build_openapi(inventory: Dict, rt_commit: str) -> Dict:
             "title": "RT REST 2.0 API",
             "version": f"0.1.0-rt-{rt_commit[:12]}",
             "description": (
-                "Phase-1 deterministic skeleton generated from RT source route regexes "
-                "and allowed_methods declarations."
+                "Phase-2 deterministic skeleton generated from RT source route regexes, "
+                "allowed_methods declarations, and RT test evidence for status/request-body hints."
             ),
         },
         "servers": [{"url": "http://localhost", "description": "Local RT instance"}],
@@ -635,6 +929,7 @@ def main() -> None:
     route_defs = collect_route_defs(resource_dir)
     test_hints = collect_test_method_hints(test_dir)
     inventory = build_inventory(route_defs, test_hints)
+    test_evidence = collect_test_evidence(test_dir)
 
     rt_commit = read_rt_commit(rt_dir)
     inventory["meta"]["rt_commit"] = rt_commit
@@ -645,9 +940,11 @@ def main() -> None:
     spec_dir.mkdir(parents=True, exist_ok=True)
 
     inventory_path = out_dir / "endpoint-inventory.json"
+    test_evidence_path = out_dir / "test-evidence.json"
     inventory_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    test_evidence_path.write_text(json.dumps(test_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    openapi = build_openapi(inventory, rt_commit)
+    openapi = build_openapi(inventory, rt_commit, test_evidence)
     spec_json_path = spec_dir / "openapi.json"
     spec_yaml_path = spec_dir / "openapi.yaml"
     spec_json_path.write_text(json.dumps(openapi, indent=2, sort_keys=False) + "\n", encoding="utf-8")
@@ -659,6 +956,7 @@ def main() -> None:
         "route_regexes": inventory["meta"]["route_regex_count"],
         "paths": inventory["meta"]["path_count"],
         "inventory": str(inventory_path.relative_to(workspace)),
+        "test_evidence": str(test_evidence_path.relative_to(workspace)),
         "openapi_json": str(spec_json_path.relative_to(workspace)),
         "openapi_yaml": str(spec_yaml_path.relative_to(workspace)),
     }
