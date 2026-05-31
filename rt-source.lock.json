@@ -1,0 +1,12 @@
+{
+  "source": {
+    "repo": "https://github.com/bestpractical/rt.git",
+    "ref": "stable",
+    "commit": "530d776903e05293927600cca506f5336928cf28"
+  },
+  "generator": {
+    "name": "extract_routes.py",
+    "phase": "phase-1 endpoint inventory + openapi skeleton"
+  },
+  "generated_at": "2026-05-31"
+}
