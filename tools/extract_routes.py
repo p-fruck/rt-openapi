@@ -5,7 +5,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 HTTP_ORDER = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 HTTP_SET = set(HTTP_ORDER)
@@ -203,6 +203,128 @@ def collect_resource_content_types(resource_dir: Path) -> Dict[str, Dict[str, Li
             "provided": sorted(mapping[resource_class]["provided"]),
         }
     return out
+
+
+def perl_type_to_openapi_schema(type_name: str, is_numeric: bool, nullable: bool) -> Dict[str, object]:
+    t = type_name.lower().strip()
+
+    schema: Dict[str, object]
+    if "datetime" in t or "timestamp" in t:
+        schema = {"type": "string", "format": "date-time"}
+    elif t == "date":
+        schema = {"type": "string", "format": "date"}
+    elif any(x in t for x in ("int", "smallint", "bigint")) or is_numeric:
+        schema = {"type": "integer"}
+    elif any(x in t for x in ("decimal", "float", "double", "numeric", "real")):
+        schema = {"type": "number"}
+    elif "bool" in t:
+        schema = {"type": "boolean"}
+    else:
+        schema = {"type": "string"}
+
+    if nullable:
+        value_type = schema.get("type")
+        if isinstance(value_type, str):
+            schema["type"] = [value_type, "null"]
+    return schema
+
+
+def extract_core_accessible_fields(text: str) -> Dict[str, Dict[str, object]]:
+    block = get_sub_block(text, "_CoreAccessible")
+    if not block:
+        return {}
+
+    start = block.find("{")
+    if start < 0:
+        return {}
+    end = find_matching_brace(block, start)
+    if end < 0:
+        return {}
+
+    inner = block[start + 1 : end]
+    field_re = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*=>\s*\{([^{}]*)\}", re.S)
+    fields: Dict[str, Dict[str, object]] = {}
+    for name, meta_text in field_re.findall(inner):
+        if not re.search(r"\bread\s*=>\s*1\b", meta_text):
+            continue
+
+        type_match = re.search(r"\btype\s*=>\s*'([^']+)'", meta_text)
+        default_match = re.search(r"\bdefault\s*=>\s*(undef|'[^']*')", meta_text)
+        is_numeric_match = re.search(r"\bis_numeric\s*=>\s*(\d+)", meta_text)
+
+        type_name = type_match.group(1) if type_match else "varchar"
+        default_raw = default_match.group(1) if default_match else "''"
+        nullable = default_raw == "undef"
+        is_numeric = bool(is_numeric_match and is_numeric_match.group(1) == "1")
+
+        fields[name] = {
+            "type": type_name,
+            "nullable": nullable,
+            "is_numeric": is_numeric,
+            "schema": perl_type_to_openapi_schema(type_name, is_numeric, nullable),
+        }
+
+    return fields
+
+
+def collect_rt_record_meta(rt_lib_dir: Path) -> Dict[str, Dict[str, Dict[str, object]]]:
+    meta: Dict[str, Dict[str, Dict[str, object]]] = {}
+    for file in sorted(rt_lib_dir.glob("*.pm")):
+        text = file.read_text(encoding="utf-8", errors="replace")
+        pkg_match = re.search(r"^\s*package\s+([A-Za-z0-9_:]+)\s*;", text, flags=re.M)
+        if not pkg_match:
+            continue
+        package = pkg_match.group(1)
+        fields = extract_core_accessible_fields(text)
+        if fields:
+            meta[package] = fields
+    return meta
+
+
+def collect_resource_record_classes(
+    resource_dir: Path,
+    rt_record_meta: Dict[str, Dict[str, Dict[str, object]]],
+) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+
+    def candidate_variants(class_name: str) -> List[str]:
+        variants = [class_name]
+        if class_name.endswith("s"):
+            variants.append(class_name[:-1])
+        return variants
+
+    for file in sorted(resource_dir.glob("*.pm")):
+        text = file.read_text(encoding="utf-8", errors="replace")
+        pkg_match = re.search(r"^\s*package\s+([A-Za-z0-9_:]+)\s*;", text, flags=re.M)
+        if not pkg_match:
+            continue
+
+        resource_class = pkg_match.group(1)
+        short = resource_class.split("::")[-1]
+        candidates: List[str] = []
+
+        for found in re.findall(r"\brecord_class\s*=>\s*'([^']+)'", text):
+            candidates.append(found)
+        for found in re.findall(r"\bcollection_class\s*=>\s*'([^']+)'", text):
+            candidates.extend(f"RT::{name}" for name in candidate_variants(found.replace("RT::", "")))
+
+        for name in candidate_variants(short):
+            candidates.append(f"RT::{name}")
+
+        seen: Set[str] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate in rt_record_meta:
+                mapping[resource_class] = candidate
+                break
+
+    return mapping
+
+
+def record_component_name(record_class: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", record_class).strip("_") + "_Record"
 
 
 def infer_route_specific_methods(route: RouteDef, path: str) -> List[str]:
@@ -918,6 +1040,77 @@ def is_collection_entry(entry: Dict[str, object]) -> bool:
     return False
 
 
+def has_resource(entry: Dict[str, object], resource_class: str) -> bool:
+    resources = entry.get("resources", [])
+    if not isinstance(resources, list):
+        return False
+    return any(r == resource_class for r in resources if isinstance(r, str))
+
+
+def has_role(entry: Dict[str, object], role_suffix: str) -> bool:
+    roles = entry.get("roles", [])
+    if not isinstance(roles, list):
+        return False
+    return any(isinstance(r, str) and r.endswith(role_suffix) for r in roles)
+
+
+def response_schema_ref_for_entry(entry: Dict[str, object], method: str) -> str:
+    if method in ("GET", "HEAD", "POST") and has_resource(entry, "RT::REST2::Resource::Transactions"):
+        return "#/components/schemas/TransactionCollectionResponse"
+    if is_collection_entry(entry):
+        return "#/components/schemas/CollectionResponse"
+    return "#/components/schemas/RecordObject"
+
+
+def build_operation_description(entry: Dict[str, object], path: str, method: str) -> str:
+    notes: List[str] = ["Auto-generated RT REST2 operation skeleton."]
+
+    if method == "POST" and path == "/ticket":
+        notes.append("Creates a new ticket.")
+        notes.append(
+            "Live validation in this RT instance accepted `Queue` as numeric id (`1`) while "
+            "`Queue=General` returned 403; prefer queue id when create permission errors mention queue name mismatches."
+        )
+
+    if has_role(entry, "Collection::QueryByJSON"):
+        notes.append(
+            "Supports JSON filter arrays via POST request bodies (ProcessPOSTasGET behavior)."
+        )
+    if has_role(entry, "Collection::QueryBySQL"):
+        notes.append("Supports SQL-like filtering through the query parameter `query`.")
+
+    if has_resource(entry, "RT::REST2::Resource::Transactions") and path.endswith("/history"):
+        notes.append("Returns transaction history for the parent record.")
+        notes.append("Use the `fields` query parameter to request additional transaction fields.")
+        notes.append(
+            "Requested fields can be present but empty when a transaction type does not carry a value "
+            "(for example `Content` on non-comment transactions)."
+        )
+        if path.startswith("/ticket/") and method in ("GET", "POST"):
+            notes.append(
+                "Ticket comments are transactions where `Type` is `Comment`; "
+                "to read comments first filter to `Type=Comment`."
+            )
+            notes.append(
+                "In observed RT behavior, comment transaction `Content` can still be empty; "
+                "retrieve the comment body from attachments via "
+                "`GET /transaction/{id}` -> `GET /transaction/{id}/attachments` -> `GET /attachment/{id}` "
+                "(attachment `Content` is base64)."
+            )
+            notes.append(
+                "Example filter: "
+                "(for example `POST /ticket/{id}/history` with `[{\"field\":\"Type\",\"operator\":\"=\",\"value\":\"Comment\"}]`)."
+            )
+
+    return " ".join(notes)
+
+
+def default_query_filter_example(entry: Dict[str, object], path: str) -> Dict[str, object]:
+    if has_resource(entry, "RT::REST2::Resource::Transactions") and path.startswith("/ticket/") and path.endswith("/history"):
+        return {"field": "Type", "operator": "=", "value": "Comment"}
+    return {"field": "Type", "operator": "=", "value": "Set"}
+
+
 def query_parameter_refs(entry: Dict[str, object], method: str, resource_query_params: Dict[str, List[str]]) -> List[Dict[str, str]]:
     if method not in ("GET", "HEAD"):
         return []
@@ -930,14 +1123,38 @@ def query_parameter_refs(entry: Dict[str, object], method: str, resource_query_p
                 for p in resource_query_params.get(resource, []):
                     discovered.add(p)
 
+    # Infer common collection controls from roles when resource files don't
+    # explicitly call request->param for each supported query key.
+    if has_role(entry, "Collection::QueryByJSON") or has_role(entry, "Collection::QueryBySQL"):
+        discovered.update({"page", "per_page", "order", "orderby"})
+    if has_role(entry, "Collection::QueryByJSON"):
+        discovered.add("fields")
+    if has_role(entry, "Collection::QueryBySQL"):
+        discovered.update({"query", "simple"})
+
     refs = []
     for name in sorted(discovered):
         refs.append({"$ref": f"#/components/parameters/{name}"})
     return refs
 
 
-def request_body_schema_for_operation(entry: Dict[str, object], evidence: Optional[Dict[str, object]]) -> Dict[str, object]:
+def request_body_schema_for_operation(
+    entry: Dict[str, object],
+    path: str,
+    method: str,
+    evidence: Optional[Dict[str, object]],
+) -> Dict[str, object]:
     roles = entry.get("roles", []) if isinstance(entry.get("roles", []), list) else []
+
+    if method == "POST" and path == "/ticket":
+        return {
+            "$ref": "#/components/schemas/TicketCreateRequest",
+        }
+
+    if method == "POST" and path.startswith("/ticket/") and path.endswith("/comment"):
+        return {
+            "$ref": "#/components/schemas/TicketCommentCreateRequest",
+        }
 
     if evidence and evidence.get("request_body") == "json":
         return {
@@ -997,6 +1214,216 @@ def schema_for_request_media_type(media_type: str, default_json_schema: Dict[str
     if media_type == "multipart/form-data":
         return {"type": "object", "additionalProperties": True}
     return {"type": "string"}
+
+
+def apply_ticket_live_overrides(operation_obj: Dict[str, object], path: str, method: str) -> None:
+    if method == "POST" and path == "/ticket":
+        request_body = operation_obj.get("requestBody")
+        if isinstance(request_body, dict):
+            request_body["required"] = True
+            content = request_body.get("content")
+            if isinstance(content, dict) and "application/json" in content:
+                content["application/json"] = {
+                    "schema": {"$ref": "#/components/schemas/TicketCreateRequest"},
+                    "example": {
+                        "Subject": "OpenAPI root create 1780243466",
+                        "Queue": "1",
+                        "Content": "Initial body from API",
+                        "ContentType": "text/plain",
+                    },
+                }
+
+        operation_obj["responses"]["201"] = {
+            "description": "Created",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/TicketCreateResponse"},
+                    "example": {
+                        "id": "3",
+                        "_url": "http://localhost:8083/REST/2.0/ticket/3",
+                        "type": "ticket",
+                    },
+                }
+            },
+        }
+        operation_obj["x-rt-live-evidence"] = {
+            "proven": True,
+            "notes": [
+                "Observed status: 201 Created.",
+                "Queue accepted as numeric id '1' in this environment.",
+            ],
+            "source": "out/live-ticket-flow.json",
+        }
+
+    if method == "PUT" and path.startswith("/ticket/") and path.count("{") == 1:
+        request_body = operation_obj.get("requestBody")
+        if isinstance(request_body, dict):
+            content = request_body.get("content")
+            if isinstance(content, dict) and "application/json" in content:
+                content["application/json"]["example"] = {
+                    "Subject": "OpenAPI root updated 1780243466",
+                }
+
+        responses = operation_obj.get("responses", {})
+        if isinstance(responses, dict) and "200" in responses:
+            resp_200 = responses.get("200")
+            if isinstance(resp_200, dict):
+                resp_200["content"] = {
+                    "application/json": {
+                        "schema": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "example": [
+                            "Ticket 3: Subject changed from 'OpenAPI root create 1780243466' to 'OpenAPI root updated 1780243466'"
+                        ],
+                    }
+                }
+
+    if method == "POST" and path.startswith("/ticket/") and path.endswith("/comment"):
+        request_body = operation_obj.get("requestBody")
+        if isinstance(request_body, dict):
+            request_body["required"] = True
+            content = request_body.get("content")
+            if isinstance(content, dict) and "application/json" in content:
+                content["application/json"] = {
+                    "schema": {"$ref": "#/components/schemas/TicketCommentCreateRequest"},
+                    "example": {
+                        "Content": "OpenAPI verified comment text",
+                        "ContentType": "text/plain",
+                    },
+                }
+
+        operation_obj["responses"]["201"] = {
+            "description": "Created",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/TicketCommentCreateResponse"},
+                    "example": ["Comments added"],
+                }
+            },
+        }
+        operation_obj["x-rt-live-evidence"] = {
+            "proven": True,
+            "notes": [
+                "POST /ticket/1/comment with application/json requires ContentType in this RT instance.",
+                "Observed status: 201 Created.",
+            ],
+            "source": "out/live-ticket-flow.json",
+        }
+
+    if method == "GET" and path.startswith("/ticket/") and path.endswith("/history"):
+        response_200 = operation_obj.get("responses", {}).get("200")
+        if isinstance(response_200, dict):
+            content = response_200.get("content")
+            if isinstance(content, dict) and "application/json" in content:
+                content["application/json"]["example"] = {
+                    "count": 1,
+                    "total": 1,
+                    "pages": 1,
+                    "per_page": 20,
+                    "page": 1,
+                    "items": [
+                        {
+                            "id": "50",
+                            "type": "transaction",
+                            "_url": "/REST/2.0/transaction/50",
+                            "Type": "Comment",
+                            "Content": "",
+                            "Created": "2026-05-31T16:00:31Z",
+                            "Creator": {
+                                "id": "root",
+                                "type": "user",
+                                "_url": "/REST/2.0/user/root",
+                            },
+                        }
+                    ],
+                }
+
+    if method == "POST" and path.startswith("/ticket/") and path.endswith("/history"):
+        request_body = operation_obj.get("requestBody")
+        if isinstance(request_body, dict):
+            content = request_body.get("content")
+            if isinstance(content, dict) and "application/json" in content:
+                content["application/json"]["example"] = [
+                    {"field": "Type", "operator": "=", "value": "Comment"}
+                ]
+        response_200 = operation_obj.get("responses", {}).get("200")
+        if isinstance(response_200, dict):
+            content = response_200.get("content")
+            if isinstance(content, dict) and "application/json" in content:
+                content["application/json"]["example"] = {
+                    "count": 1,
+                    "total": 1,
+                    "pages": 1,
+                    "per_page": 20,
+                    "page": 1,
+                    "items": [
+                        {
+                            "id": "50",
+                            "type": "transaction",
+                            "_url": "/REST/2.0/transaction/50",
+                        }
+                    ],
+                }
+
+
+def default_response_example(schema_ref: str) -> Dict[str, object]:
+    if schema_ref == "#/components/schemas/TransactionCollectionResponse":
+        return {
+            "count": 2,
+            "total": None,
+            "pages": 1,
+            "per_page": 20,
+            "page": 1,
+            "next_page": None,
+            "prev_page": None,
+            "items": [
+                {
+                    "id": 101,
+                    "type": "transaction",
+                    "_url": "/REST/2.0/transaction/101",
+                    "Type": "Create",
+                    "Content": "Asset created",
+                    "ContentType": "text/plain",
+                },
+                {
+                    "id": 102,
+                    "type": "transaction",
+                    "_url": "/REST/2.0/transaction/102",
+                    "Type": "Set",
+                    "Field": "Status",
+                    "OldValue": "new",
+                    "NewValue": "allocated",
+                    "Content": "",
+                    "ContentType": "",
+                },
+            ],
+        }
+    if schema_ref == "#/components/schemas/CollectionResponse":
+        return {
+            "count": 1,
+            "total": 1,
+            "pages": 1,
+            "per_page": 20,
+            "page": 1,
+            "next_page": None,
+            "prev_page": None,
+            "items": [
+                {
+                    "id": 1,
+                    "type": "record",
+                    "_url": "/REST/2.0/example/1",
+                    "_hyperlinks": [],
+                }
+            ],
+        }
+    return {
+        "id": 1,
+        "type": "record",
+        "_url": "/REST/2.0/example/1",
+        "_hyperlinks": [],
+    }
 
 
 def response_for_method(method: str) -> Tuple[str, Dict[str, object]]:
@@ -1127,11 +1554,32 @@ def build_openapi(
     resource_query_params: Dict[str, List[str]],
     resource_content_types: Dict[str, Dict[str, List[str]]],
     test_examples: Dict[str, object],
+    rt_record_meta: Dict[str, Dict[str, Dict[str, object]]],
+    resource_record_classes: Dict[str, str],
 ) -> Dict:
     paths_obj: Dict[str, Dict[str, object]] = {}
     evidence_index = index_test_evidence(test_evidence)
     example_index = index_test_examples(test_examples)
     head_405_set = set(head_405_operations)
+
+    record_components: Dict[str, str] = {
+        record_class: record_component_name(record_class)
+        for record_class in sorted(set(resource_record_classes.values()))
+        if record_class in rt_record_meta
+    }
+    generated_collection_schemas: Dict[str, Dict[str, object]] = {}
+
+    def infer_record_component_for_entry(entry: Dict[str, object]) -> Optional[str]:
+        resources = entry.get("resources", [])
+        if not isinstance(resources, list):
+            return None
+        for resource in resources:
+            if not isinstance(resource, str):
+                continue
+            record_class = resource_record_classes.get(resource)
+            if record_class and record_class in record_components:
+                return record_components[record_class]
+        return None
 
     for entry in inventory["paths"]:
         path = entry["path"]
@@ -1176,10 +1624,7 @@ def build_openapi(
             operation_obj: Dict[str, object] = {
                 "operationId": operation_id,
                 "tags": [tag_for_path(path)],
-                "description": (
-                    "Auto-generated RT REST2 operation skeleton. "
-                    "Schema and examples to be enriched in later phases."
-                ),
+                "description": build_operation_description(entry, path, method),
                 "responses": responses,
                 "security": [
                     {"tokenAuth": []},
@@ -1196,12 +1641,37 @@ def build_openapi(
 
             if method in ("GET", "HEAD") and "200" in responses:
                 response_media_types = media_types.get("provided") or ["application/json"]
+                response_schema_ref = response_schema_ref_for_entry(entry, method)
+                record_component = infer_record_component_for_entry(entry)
+
+                if response_schema_ref == "#/components/schemas/RecordObject" and record_component:
+                    response_schema_ref = f"#/components/schemas/{record_component}"
+                elif response_schema_ref == "#/components/schemas/CollectionResponse" and record_component:
+                    collection_component = f"{record_component}_Collection"
+                    if collection_component not in generated_collection_schemas:
+                        generated_collection_schemas[collection_component] = {
+                            "type": "object",
+                            "properties": {
+                                "count": {"type": "integer"},
+                                "total": {"type": ["integer", "null"]},
+                                "pages": {"type": ["integer", "null"]},
+                                "per_page": {"type": "integer"},
+                                "page": {"type": "integer"},
+                                "next_page": {"type": ["string", "null"]},
+                                "prev_page": {"type": ["string", "null"]},
+                                "items": {
+                                    "type": "array",
+                                    "items": {"$ref": f"#/components/schemas/{record_component}"},
+                                },
+                            },
+                            "required": ["count", "items"],
+                            "additionalProperties": True,
+                        }
+                    response_schema_ref = f"#/components/schemas/{collection_component}"
                 response_content = {
                     media: {
                         "schema": {
-                            "$ref": "#/components/schemas/CollectionResponse"
-                            if is_collection_entry(entry)
-                            else "#/components/schemas/RecordObject"
+                            "$ref": response_schema_ref
                         }
                     }
                     for media in response_media_types
@@ -1216,9 +1686,38 @@ def build_openapi(
                         example_obj = {key: "<example>" for key in hints[:20] if isinstance(key, str)}
                         for media in response_content:
                             operation_obj["responses"]["200"]["content"][media]["example"] = example_obj
+                else:
+                    fallback_example = default_response_example(response_schema_ref)
+                    for media in response_content:
+                        operation_obj["responses"]["200"]["content"][media]["example"] = fallback_example
+
+            if method == "POST" and "200" in responses:
+                response_schema_ref = response_schema_ref_for_entry(entry, method)
+                record_component = infer_record_component_for_entry(entry)
+                if response_schema_ref == "#/components/schemas/CollectionResponse" and record_component:
+                    collection_component = f"{record_component}_Collection"
+                    if collection_component in generated_collection_schemas:
+                        response_schema_ref = f"#/components/schemas/{collection_component}"
+                if response_schema_ref != "#/components/schemas/RecordObject":
+                    response_media_types = media_types.get("provided") or ["application/json"]
+                    response_content = {
+                        media: {
+                            "schema": {
+                                "$ref": response_schema_ref
+                            }
+                        }
+                        for media in response_media_types
+                    }
+                    operation_obj["responses"]["200"] = {
+                        "description": "OK",
+                        "content": response_content,
+                    }
+                    fallback_example = default_response_example(response_schema_ref)
+                    for media in response_content:
+                        operation_obj["responses"]["200"]["content"][media]["example"] = fallback_example
 
             if method in ("POST", "PUT", "PATCH"):
-                default_json_schema = request_body_schema_for_operation(entry, evidence)
+                default_json_schema = request_body_schema_for_operation(entry, path, method, evidence)
                 request_media_types = media_types.get("accepted") or ["application/json"]
                 request_content = {
                     media: {"schema": schema_for_request_media_type(media, default_json_schema)}
@@ -1228,10 +1727,16 @@ def build_openapi(
                     req_example = test_example.get("request_example")
                     if "application/json" in request_content:
                         request_content["application/json"]["example"] = req_example
+                elif has_role(entry, "Collection::QueryByJSON") and "application/json" in request_content:
+                    request_content["application/json"]["example"] = [
+                        default_query_filter_example(entry, path)
+                    ]
                 operation_obj["requestBody"] = {
                     "required": False,
                     "content": request_content,
                 }
+
+            apply_ticket_live_overrides(operation_obj, path, method)
 
             if evidence:
 
@@ -1264,6 +1769,32 @@ def build_openapi(
 
         paths_obj[path] = path_item
 
+    meta_record_schemas: Dict[str, Dict[str, object]] = {}
+    for record_class, component_name in record_components.items():
+        fields = rt_record_meta.get(record_class, {})
+        properties: Dict[str, object] = {
+            "id": {},
+            "type": {"type": "string"},
+            "_url": {"type": "string"},
+            "_hyperlinks": {
+                "type": "array",
+                "items": {"$ref": "#/components/schemas/Hyperlink"},
+            },
+        }
+
+        for field_name in sorted(fields):
+            schema = fields[field_name].get("schema", {})
+            if isinstance(schema, dict):
+                properties[field_name] = schema
+
+        meta_record_schemas[component_name] = {
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": True,
+            "x-rt-record-class": record_class,
+            "description": f"Derived from {record_class}::_CoreAccessible metadata.",
+        }
+
     return {
         "openapi": "3.1.0",
         "info": {
@@ -1274,7 +1805,7 @@ def build_openapi(
                 "RT test evidence, and runtime probe-driven response/method refinements."
             ),
         },
-        "servers": [{"url": "http://localhost", "description": "Local RT instance"}],
+        "servers": [{"url": "http://localhost/REST/2.0", "description": "Local RT instance"}],
         "paths": paths_obj,
         "x-rt-runtime-overrides": runtime_meta,
         "components": {
@@ -1376,6 +1907,46 @@ def build_openapi(
                     "required": ["field", "value"],
                     "additionalProperties": True,
                 },
+                "TicketCommentCreateRequest": {
+                    "type": "object",
+                    "properties": {
+                        "Content": {"type": "string"},
+                        "ContentType": {"type": "string", "example": "text/plain"},
+                    },
+                    "required": ["Content", "ContentType"],
+                    "additionalProperties": True,
+                    "description": "Observed for application/json comment creation in RT REST 2.0.",
+                },
+                "TicketCreateRequest": {
+                    "type": "object",
+                    "properties": {
+                        "Subject": {"type": "string"},
+                        "Queue": {
+                            "oneOf": [{"type": "string"}, {"type": "integer", "format": "int64"}],
+                            "description": "Queue name or id.",
+                        },
+                        "Content": {"type": "string"},
+                        "ContentType": {"type": "string", "example": "text/plain"},
+                    },
+                    "required": ["Subject", "Queue"],
+                    "additionalProperties": True,
+                    "description": "Observed for application/json ticket creation in RT REST 2.0.",
+                },
+                "TicketCreateResponse": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "_url": {"type": "string"},
+                        "type": {"type": "string", "enum": ["ticket"]},
+                    },
+                    "required": ["id", "_url", "type"],
+                    "additionalProperties": True,
+                },
+                "TicketCommentCreateResponse": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "RT returns a message list, for example ['Comments added'].",
+                },
                 "Hyperlink": {
                     "type": "object",
                     "properties": {
@@ -1399,11 +1970,60 @@ def build_openapi(
                     },
                     "additionalProperties": True,
                 },
+                "TransactionRecord": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "format": "int64"},
+                        "type": {"type": "string", "enum": ["transaction"]},
+                        "_url": {"type": "string"},
+                        "_hyperlinks": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/TransactionHyperlink"},
+                        },
+                        "Type": {"type": "string"},
+                        "Field": {"type": "string"},
+                        "OldValue": {"type": ["string", "null"]},
+                        "NewValue": {"type": ["string", "null"]},
+                        "Content": {"type": "string"},
+                        "ContentType": {"type": "string"},
+                        "TimeTaken": {"type": ["number", "string", "null"]},
+                        "Creator": {"$ref": "#/components/schemas/TransactionEntityRef"},
+                        "Object": {"$ref": "#/components/schemas/TransactionEntityRef"},
+                        "Created": {"type": "string"},
+                    },
+                    "required": ["id", "type", "_url"],
+                    "additionalProperties": False,
+                },
+                "TransactionEntityRef": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"oneOf": [{"type": "integer"}, {"type": "string"}]},
+                        "type": {"type": "string"},
+                        "_url": {"type": "string"},
+                    },
+                    "required": ["id", "type", "_url"],
+                    "additionalProperties": False,
+                },
+                "TransactionHyperlink": {
+                    "type": "object",
+                    "properties": {
+                        "ref": {"type": "string"},
+                        "type": {"type": "string"},
+                        "id": {"oneOf": [{"type": "integer"}, {"type": "string"}]},
+                        "_url": {"type": "string"},
+                        "label": {"type": "string"},
+                        "from": {"type": "string"},
+                        "to": {"type": "string"},
+                    },
+                    "required": ["ref", "_url"],
+                    "additionalProperties": False,
+                },
                 "CollectionResponse": {
                     "type": "object",
                     "properties": {
                         "count": {"type": "integer"},
                         "total": {"type": ["integer", "null"]},
+                        "pages": {"type": ["integer", "null"]},
                         "per_page": {"type": "integer"},
                         "page": {"type": "integer"},
                         "next_page": {"type": ["string", "null"]},
@@ -1416,6 +2036,26 @@ def build_openapi(
                     "required": ["count", "items"],
                     "additionalProperties": True,
                 },
+                "TransactionCollectionResponse": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                        "total": {"type": ["integer", "null"]},
+                        "pages": {"type": ["integer", "null"]},
+                        "per_page": {"type": "integer"},
+                        "page": {"type": "integer"},
+                        "next_page": {"type": ["string", "null"]},
+                        "prev_page": {"type": ["string", "null"]},
+                        "items": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/TransactionRecord"},
+                        },
+                    },
+                    "required": ["count", "items"],
+                    "additionalProperties": False,
+                },
+                **meta_record_schemas,
+                **generated_collection_schemas,
             },
             "securitySchemes": {
                 "tokenAuth": {
@@ -1515,6 +2155,7 @@ def main() -> None:
 
     workspace = Path(args.workspace).resolve()
     rt_dir = workspace / "vendor" / "rt"
+    rt_lib_dir = rt_dir / "lib" / "RT"
     resource_dir = rt_dir / "lib" / "RT" / "REST2" / "Resource"
     test_dir = rt_dir / "t" / "rest2"
 
@@ -1524,6 +2165,8 @@ def main() -> None:
     route_defs = collect_route_defs(resource_dir)
     resource_query_params = collect_resource_query_params(resource_dir)
     resource_content_types = collect_resource_content_types(resource_dir)
+    rt_record_meta = collect_rt_record_meta(rt_lib_dir)
+    resource_record_classes = collect_resource_record_classes(resource_dir, rt_record_meta)
     test_hints = collect_test_method_hints(test_dir)
     inventory = build_inventory(route_defs, test_hints)
     test_evidence = collect_test_evidence(test_dir)
@@ -1542,10 +2185,23 @@ def main() -> None:
     inventory_path = out_dir / "endpoint-inventory.json"
     test_evidence_path = out_dir / "test-evidence.json"
     test_examples_path = out_dir / "test-examples.json"
+    record_meta_path = out_dir / "record-meta.json"
     runtime_overrides_path = out_dir / "runtime-overrides.json"
     inventory_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     test_evidence_path.write_text(json.dumps(test_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     test_examples_path.write_text(json.dumps(test_examples, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    record_meta_path.write_text(
+        json.dumps(
+            {
+                "resource_record_classes": resource_record_classes,
+                "rt_record_meta": rt_record_meta,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     runtime_overrides_path.write_text(
         json.dumps(
             {
@@ -1570,6 +2226,8 @@ def main() -> None:
         resource_query_params,
         resource_content_types,
         test_examples,
+        rt_record_meta,
+        resource_record_classes,
     )
     spec_json_path = spec_dir / "openapi.json"
     spec_yaml_path = spec_dir / "openapi.yaml"
@@ -1584,6 +2242,7 @@ def main() -> None:
         "inventory": str(inventory_path.relative_to(workspace)),
         "test_evidence": str(test_evidence_path.relative_to(workspace)),
         "test_examples": str(test_examples_path.relative_to(workspace)),
+        "record_meta": str(record_meta_path.relative_to(workspace)),
         "runtime_overrides": str(runtime_overrides_path.relative_to(workspace)),
         "openapi_json": str(spec_json_path.relative_to(workspace)),
         "openapi_yaml": str(spec_yaml_path.relative_to(workspace)),

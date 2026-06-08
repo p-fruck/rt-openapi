@@ -1,7 +1,7 @@
 PYTHON ?= python3
 WORKSPACE := $(CURDIR)
 
-.PHONY: extract probe analyze snapshot delta phase3 verify clean
+.PHONY: extract probe analyze snapshot delta phase3 test verify clean
 
 extract:
 	$(PYTHON) tools/extract_routes.py --workspace $(WORKSPACE)
@@ -21,10 +21,14 @@ delta:
 phase3: extract probe analyze
 	@echo "Phase 3 artifacts refreshed (inventory, spec, probe, analysis)."
 
-verify: extract
+test:
+	$(PYTHON) -m unittest discover -s tools -p 'test_*.py'
+
+verify: extract test
 	@python3 -m json.tool out/endpoint-inventory.json >/dev/null
 	@python3 -m json.tool out/test-evidence.json >/dev/null
 	@python3 -m json.tool out/test-examples.json >/dev/null
+	@python3 -m json.tool out/record-meta.json >/dev/null
 	@python3 -m json.tool out/runtime-overrides.json >/dev/null
 	@python3 -m json.tool spec/openapi.json >/dev/null
 	@python3 -m json.tool out/probe-results.json >/dev/null || true
@@ -34,4 +38,4 @@ verify: extract
 	@echo "Artifacts generated and JSON is valid."
 
 clean:
-	rm -f out/endpoint-inventory.json out/test-evidence.json out/test-examples.json out/runtime-overrides.json out/probe-analysis.baseline.json out/probe-delta.json out/probe-delta.md spec/openapi.json spec/openapi.yaml
+	rm -f out/endpoint-inventory.json out/test-evidence.json out/test-examples.json out/record-meta.json out/runtime-overrides.json out/probe-analysis.baseline.json out/probe-delta.json out/probe-delta.md spec/openapi.json spec/openapi.yaml
