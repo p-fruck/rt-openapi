@@ -1,0 +1,62 @@
+name: Generate & Publish OpenAPI Spec
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * *'   # nightly at 03:00 UTC
+  workflow_dispatch:        # allow manual runs
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clone RT source (stable branch)
+        run: |
+          git clone --depth 1 --branch stable \
+            https://github.com/bestpractical/rt.git vendor/rt
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Generate OpenAPI spec
+        run: python3 tools/extract_routes.py
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp web/index.html web/swagger-ui.html web/redoc.html _site/
+          cp spec/openapi.yaml spec/openapi.json _site/
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
